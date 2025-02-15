@@ -1,16 +1,15 @@
 /***********************************************************
- * Optimized P-Only Position Control with Quadrature Encoder
+ * PID Position Control with Quadrature Encoder (N20 Motor)
  * and Dual PWM Motor Signals
  * ---------------------------------------------------------
- * In this configuration, the motor driver uses two inputs:
- *   - MOTOR_PIN_A and MOTOR_PIN_B
- * To drive the motor:
+ * For a small N20 motor, recommended starting PID values:
+ *   Kp = 4.0, Ki = 0.8, Kd = 0.2
+ *
+ * Motor driver configuration:
  *   - Forward:  MOTOR_PIN_A = PWM; MOTOR_PIN_B = 0
  *   - Reverse:  MOTOR_PIN_A = 0;   MOTOR_PIN_B = PWM
  *
  * Encoder is on pins D2 (INT0) & D3 (INT1).
- *
- * The controller accepts position setpoint commands via Serial.
  ***********************************************************/
 
 #include <Arduino.h>
@@ -23,7 +22,7 @@ static const uint8_t PIN_ENC_B     = 3; // Encoder channel B (INT1)
 
 // ---------------- Encoder State ------------------
 volatile long encoderCount = 0;  
-volatile uint8_t lastAB   = 0;   // last 2-bit state of encoder A/B
+volatile uint8_t lastAB   = 0;   // Last 2-bit state of encoder A/B
 
 // A 16-entry lookup table for quadrature decoding.
 // Index = (oldState << 2) | newState.
@@ -34,13 +33,21 @@ static const int8_t QDEC_LOOKUP[16] = {
   0, -1, +1,  0    // 12..15
 };
 
-// ---------------- Control Parameters -------------
-float Kp = 1.0;            // Proportional gain
-long  targetPosition = 0;  // Set via serial commands
+// ---------------- PID Control Parameters -------------
+// Starting values tuned for a small N20 motor
+float Kp = 2;   // Proportional gain
+float Ki = 0;   // Integral gain
+float Kd = 0;   // Derivative gain
+
+float integral = 0.0;
+long  lastError = 0;
+
+long targetPosition = 0;  // Set via serial commands
 
 // Control loop timing (every 20 ms)
 unsigned long lastControlTime = 0;
 const unsigned long CONTROL_INTERVAL = 20; // ms
+const float dt = CONTROL_INTERVAL / 1000.0;  // dt in seconds
 
 // ---------------- Serial Input Buffer ------------
 #define CMD_BUFFER_SIZE 16
@@ -50,7 +57,7 @@ uint8_t cmdIndex = 0;
 // --------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  Serial.println("P-Only Position Control (Dual PWM Signals)");
+  Serial.println("PID Position Control for N20 Motor");
   Serial.println("Enter a setpoint (e.g. 1000) and press Enter");
 
   // Motor pins
@@ -75,27 +82,27 @@ void setup() {
   lastControlTime = millis();
 }
 
-// --------------------------------------------------
 void loop() {
   // 1) Handle incoming serial data (new target positions)
   readSerial();
 
-  // 2) Run P-control loop at fixed interval
+  // 2) Run PID control loop at fixed interval
   unsigned long now = millis();
   if (now - lastControlTime >= CONTROL_INTERVAL) {
     lastControlTime = now;
 
-    // Copy volatile encoderCount safely
+    // Safely copy the volatile encoderCount
     long currentPos;
     noInterrupts();
     currentPos = encoderCount;
     interrupts();
 
-    // Calculate error
+    // PID calculations
     long error = targetPosition - currentPos;
-
-    // Proportional output (using floating point gain)
-    float output = Kp * (float)error; 
+    integral += error * dt;
+    float derivative = (error - lastError) / dt;
+    float output = Kp * error + Ki * integral + Kd * derivative;
+    lastError = error;
 
     // Clamp output to [-255, 255]
     if (output > 255.0f)  output = 255.0f;
@@ -109,6 +116,8 @@ void loop() {
     Serial.print(currentPos);
     Serial.print("  Tgt=");
     Serial.print(targetPosition);
+    Serial.print("  Err=");
+    Serial.print(error);
     Serial.print("  Out=");
     Serial.println(output, 1);
   }
@@ -116,9 +125,7 @@ void loop() {
 
 // --------------------------------------------------
 // driveMotor: Drives the motor using two PWM signals.
-// If the command is positive, output PWM on MOTOR_PIN_A (forward).
-// If negative, output PWM on MOTOR_PIN_B (reverse).
-// --------------------------------------------------
+// Positive command drives forward; negative drives reverse.
 void driveMotor(float cmd) {
   int pwmVal = abs((int)cmd);
   if (pwmVal > 255) pwmVal = 255;
@@ -134,8 +141,6 @@ void driveMotor(float cmd) {
 
 // --------------------------------------------------
 // readSerial: Non-blocking read of serial input for setpoint.
-// Waits for newline or carriage return, then parses as long.
-// --------------------------------------------------
 void readSerial() {
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
@@ -157,14 +162,12 @@ void readSerial() {
 }
 
 // --------------------------------------------------
-// isrEnc: Single ISR for both encoder channels.
-// Uses the lookup table to update encoderCount.
-// --------------------------------------------------
+// isrEnc: ISR for encoder channels; uses lookup table to update encoderCount.
 void isrEnc() {
   uint8_t a = digitalRead(PIN_ENC_A);
   uint8_t b = digitalRead(PIN_ENC_B);
   uint8_t newAB = (a << 1) | b;
-  uint8_t index = (lastAB << 2) | newAB;  // Range: 0..15
+  uint8_t index = (lastAB << 2) | newAB;
   encoderCount += QDEC_LOOKUP[index & 0x0F];
   lastAB = newAB;
 }
