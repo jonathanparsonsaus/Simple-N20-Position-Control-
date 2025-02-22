@@ -1,0 +1,236 @@
+/***********************************************************
+ * PID Position Control with Quadrature Encoder (N20 Motor)
+ * and Dual PWM Motor Signals, plus Two Push Button Inputs:
+ *
+ *   - Pin 4: Motor enable (active while pressed, with internal pull-up)
+ *   - Pin 5: Motor direction control (with internal pull-up)
+ *
+ * When the on/off button (pin 4) is held down, the motor is enabled.
+ * While enabled, the direction button (pin 5) sets the target:
+ *   - Pressed (LOW)  --> targetPosition = 1000 (e.g. "forward")
+ *   - Released (HIGH) --> targetPosition = 0    (e.g. "reverse")
+ *
+ * When the on/off button is released, the motor stops.
+ *
+ * Serial output is printed every control loop to help with debugging.
+ ***********************************************************/
+
+#include <Arduino.h>
+
+// ---------------- Pin Definitions ----------------
+// Motor driver PWM output pins.
+static const uint8_t MOTOR_PIN_A = 9; // PWM for forward motion.
+static const uint8_t MOTOR_PIN_B = 8; // PWM for reverse motion.
+
+// Encoder pins (using hardware interrupts).
+static const uint8_t PIN_ENC_A = 2;   // Encoder channel A (INT0)
+static const uint8_t PIN_ENC_B = 3;   // Encoder channel B (INT1)
+
+// Push button pins (internal pull-ups enabled).
+static const uint8_t PIN_BTN_ENABLE = 4; // Motor enable button.
+static const uint8_t PIN_BTN_DIR    = 5; // Motor direction control.
+
+// (Optional) Debounce delay for the enable button.
+const unsigned long debounceDelay = 50;
+
+// ---------------- Encoder State ------------------
+volatile long encoderCount = 0;
+volatile uint8_t lastAB = 0;
+
+// ---------------- Quadrature Decoder Lookup Table ------------------
+static const int8_t QDEC_LOOKUP[16] = {
+  0,  +1, -1,  0,
+ -1,  0,  0,  +1,
+ +1,  0,  0,  -1,
+  0,  -1, +1,  0
+};
+
+// ---------------- PID Control Parameters -------------
+float Kp = 1.0;
+float Ki = 0.0;
+float Kd = 0.0;
+
+float integral = 0.0;
+long lastError = 0;
+long targetPosition = 0;  // Updated by the direction push button.
+
+// ---------------- Control Loop Timing ------------------
+unsigned long lastControlTime = 0;
+const unsigned long CONTROL_INTERVAL = 20;   // 20 ms
+const float dt = CONTROL_INTERVAL / 1000.0;      // seconds
+
+// ---------------- Serial Input Buffer ------------------
+#define CMD_BUFFER_SIZE 16
+char cmdBuffer[CMD_BUFFER_SIZE];
+uint8_t cmdIndex = 0;
+
+// ---------------- Motor Enable State ------------------
+bool motorEnabled = false;  // Active only while the enable button is pressed.
+
+////////////////////////////////////////////////////////////
+// setup()
+////////////////////////////////////////////////////////////
+void setup() {
+  Serial.begin(115200);
+  Serial.println("PID Position Control for N20 Motor with Momentary Push Buttons");
+  Serial.println("Hold the Enable button (pin 4) to run the motor.");
+  Serial.println("While held, the Direction button (pin 5) sets target: LOW=1000, HIGH=0.");
+  
+  // Setup motor output pins.
+  pinMode(MOTOR_PIN_A, OUTPUT);
+  pinMode(MOTOR_PIN_B, OUTPUT);
+  analogWrite(MOTOR_PIN_A, 0);
+  analogWrite(MOTOR_PIN_B, 0);
+
+  // Setup encoder pins.
+  pinMode(PIN_ENC_A, INPUT);
+  pinMode(PIN_ENC_B, INPUT);
+
+  // Setup push buttons with internal pull-ups.
+  pinMode(PIN_BTN_ENABLE, INPUT_PULLUP);
+  pinMode(PIN_BTN_DIR, INPUT_PULLUP);
+
+  // Initialize encoder state.
+  uint8_t a = digitalRead(PIN_ENC_A);
+  uint8_t b = digitalRead(PIN_ENC_B);
+  lastAB = (a << 1) | b;
+
+  // Attach interrupts for encoder channels.
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), isrEnc, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), isrEnc, CHANGE);
+
+  lastControlTime = millis();
+}
+
+////////////////////////////////////////////////////////////
+// loop()
+////////////////////////////////////////////////////////////
+void loop() {
+  // Process push buttons.
+  checkPushButtons();
+
+  // You can still update targetPosition via Serial when the motor is off.
+  if (!motorEnabled) {
+    readSerial();
+  }
+
+  unsigned long now = millis();
+  if (now - lastControlTime >= CONTROL_INTERVAL) {
+    lastControlTime = now;
+
+    long currentPos;
+    noInterrupts();
+    currentPos = encoderCount;
+    interrupts();
+
+    if (!motorEnabled) {
+      // Motor disabled: ensure motor output is zero.
+      driveMotor(0);
+      Serial.print("Disabled | ");
+      Serial.print("Pos=");
+      Serial.print(currentPos);
+      Serial.print("  Tgt=");
+      Serial.println(targetPosition);
+    } else {
+      // Motor enabled: run PID control.
+      long error = targetPosition - currentPos;
+      integral += error * dt;
+      float derivative = (error - lastError) / dt;
+      float output = Kp * error + Ki * integral + Kd * derivative;
+      lastError = error;
+
+      // Clamp PID output.
+      if (output > 255.0f)  output = 255.0f;
+      if (output < -255.0f) output = -255.0f;
+
+      driveMotor(output);
+
+      Serial.print("Enabled  | ");
+      Serial.print("Pos=");
+      Serial.print(currentPos);
+      Serial.print("  Tgt=");
+      Serial.print(targetPosition);
+      Serial.print("  Err=");
+      Serial.print(error);
+      Serial.print("  Out=");
+      Serial.println(output, 1);
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////
+// driveMotor()
+// Drives the motor using two PWM channels based on PID output.
+////////////////////////////////////////////////////////////
+void driveMotor(float cmd) {
+  int pwmVal = abs((int)cmd);
+  if (pwmVal > 255) pwmVal = 255;
+
+  if (cmd >= 0) {
+    analogWrite(MOTOR_PIN_A, pwmVal);
+    analogWrite(MOTOR_PIN_B, 0);
+  } else {
+    analogWrite(MOTOR_PIN_A, 0);
+    analogWrite(MOTOR_PIN_B, pwmVal);
+  }
+}
+
+////////////////////////////////////////////////////////////
+// readSerial()
+// Processes serial input to update targetPosition when motor is off.
+////////////////////////////////////////////////////////////
+void readSerial() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (cmdIndex > 0) {
+        cmdBuffer[cmdIndex] = '\0';
+        long val = atol(cmdBuffer);
+        targetPosition = val;
+        Serial.print("New target from Serial: ");
+        Serial.println(val);
+        cmdIndex = 0;
+      }
+    } else {
+      if (cmdIndex < CMD_BUFFER_SIZE - 1) {
+        cmdBuffer[cmdIndex++] = c;
+      }
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////
+// isrEnc()
+// Interrupt Service Routine for the quadrature encoder.
+////////////////////////////////////////////////////////////
+void isrEnc() {
+  uint8_t a = digitalRead(PIN_ENC_A);
+  uint8_t b = digitalRead(PIN_ENC_B);
+  uint8_t newAB = (a << 1) | b;
+  uint8_t index = (lastAB << 2) | newAB;
+  encoderCount += QDEC_LOOKUP[index & 0x0F];
+  lastAB = newAB;
+}
+
+////////////////////////////////////////////////////////////
+// checkPushButtons()
+// Reads the enable and direction push buttons.
+// - Motor is enabled only while the enable button (pin 4) is pressed.
+// - When enabled, the direction button (pin 5) sets targetPosition.
+////////////////////////////////////////////////////////////
+void checkPushButtons() {
+  // --- Motor Enable Button (Pin 4) ---
+  // Since the button uses INPUT_PULLUP, it's pressed when LOW.
+  // (Optional: add debounce logic if needed.)
+  motorEnabled = (digitalRead(PIN_BTN_ENABLE) == LOW);
+  
+  // --- Direction Button (Pin 5) ---
+  // When motor is enabled, set target based on the direction button.
+  if (motorEnabled) {
+    if (digitalRead(PIN_BTN_DIR) == LOW) {
+      targetPosition = 55000;
+    } else {
+      targetPosition = 0;
+    }
+  }
+}
